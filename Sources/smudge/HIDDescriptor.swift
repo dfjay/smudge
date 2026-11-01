@@ -4,6 +4,13 @@ import Foundation
 struct HIDField {
     enum Kind { case input, output, feature }
 
+    struct Collection {
+        /// Unique across the descriptor, in order of appearance.
+        let index: Int
+        /// Usage page << 16 | usage id.
+        let usage: UInt32
+    }
+
     let kind: Kind
     let reportID: UInt8
     let usagePage: UInt32
@@ -14,15 +21,18 @@ struct HIDField {
     let logicalMin: Int64
     let logicalMax: Int64
     let isConstant: Bool
-    /// Index of the innermost enclosing collection, unique across the descriptor.
-    let collection: Int
-    /// Usage (page << 16 | id) of the innermost enclosing collection.
-    let collectionUsage: UInt32
+    /// Enclosing collections, outermost first.
+    let collections: [Collection]
 
     func matches(_ page: UInt32, _ id: UInt32) -> Bool { usagePage == page && usage == id }
 
+    /// The innermost enclosing collection with the given usage.
+    func collection(_ page: UInt32, _ id: UInt32) -> Collection? {
+        collections.last { $0.usage == page << 16 | id }
+    }
+
     func read(_ payload: UnsafeBufferPointer<UInt8>) -> Int64? {
-        guard bitOffset + bitSize <= payload.count * 8 else { return nil }
+        guard bitSize > 0, bitOffset + bitSize <= payload.count * 8 else { return nil }
         var raw: UInt64 = 0
         for i in 0..<bitSize {
             let bit = bitOffset + i
@@ -60,25 +70,73 @@ struct HIDDescriptor {
         ((bitsPerReport[kind]?[reportID] ?? 0) + 7) / 8
     }
 
+    /// Local usage items in descriptor order; ranges stay unexpanded.
+    private enum UsageItem {
+        case single(UInt32)
+        case range(UInt32, UInt32)
+
+        var count: Int {
+            switch self {
+            case .single: 1
+            case let .range(lo, hi): Int(hi - lo) + 1
+            }
+        }
+    }
+
+    /// The n-th usage of a main item; the last usage repeats for remaining fields (HID 1.11, 6.2.2.8).
+    private static func usage(_ items: [UsageItem], at n: Int) -> UInt32 {
+        var n = n
+        for item in items {
+            if n < item.count {
+                switch item {
+                case let .single(usage): return usage
+                case let .range(lo, _): return lo + UInt32(n)
+                }
+            }
+            n -= item.count
+        }
+        switch items.last {
+        case let .single(usage): return usage
+        case let .range(_, hi): return hi
+        case nil: return 0
+        }
+    }
+
     init(_ bytes: [UInt8]) {
         struct Globals {
             var usagePage: UInt32 = 0
             var logicalMin: Int64 = 0
-            var logicalMax: Int64 = 0
+            /// Logical Maximum as signed and as unsigned in its own item width; which one
+            /// applies depends on whether Logical Minimum is negative.
+            var logicalMaxSigned: Int64 = 0
+            var logicalMaxUnsigned: Int64 = 0
             var reportSize = 0
             var reportCount = 0
             var reportID: UInt8 = 0
         }
         var globals = Globals()
         var globalStack: [Globals] = []
-        var usages: [UInt32] = []
+        var usages: [UsageItem] = []
         var usageMin: UInt32?
         var usageMax: UInt32?
-        var collections: [(index: Int, usage: UInt32)] = []
+        var collections: [HIDField.Collection] = []
         var nextCollection = 0
 
         func qualify(_ value: UInt32, size: Int) -> UInt32 {
             size == 4 ? value : (globals.usagePage << 16) | value
+        }
+
+        func closeRangeIfComplete() {
+            guard let lo = usageMin, let hi = usageMax else { return }
+            if lo <= hi { usages.append(.range(lo, hi)) }
+            usageMin = nil
+            usageMax = nil
+        }
+
+        func resetLocals() {
+            usages = []
+            usageMin = nil
+            usageMax = nil
         }
 
         var i = 0
@@ -107,50 +165,50 @@ struct HIDDescriptor {
             // Main items
             case (0, 0x8), (0, 0x9), (0, 0xB):
                 let kind: HIDField.Kind = tag == 0x8 ? .input : tag == 0x9 ? .output : .feature
-                var list = usages
-                if list.isEmpty, let lo = usageMin, let hi = usageMax, lo <= hi {
-                    list = Array(lo...hi)
-                }
                 let rid = globals.reportID
                 var offset = bitsPerReport[kind]?[rid] ?? 0
-                let (cIndex, cUsage) = collections.last ?? (-1, 0)
-                // Logical max is frequently encoded without a sign bit (e.g. 0xFF in one byte).
-                let lmax = globals.logicalMax < globals.logicalMin
-                    ? globals.logicalMax & ((1 << Int64(globals.reportSize)) - 1)
-                    : globals.logicalMax
+                let logicalMax = globals.logicalMin < 0 ? globals.logicalMaxSigned : globals.logicalMaxUnsigned
                 for n in 0..<globals.reportCount {
-                    let qualified = list.isEmpty ? 0 : list[min(n, list.count - 1)]
+                    let qualified = Self.usage(usages, at: n)
                     fields.append(HIDField(
                         kind: kind, reportID: rid,
                         usagePage: qualified >> 16, usage: qualified & 0xFFFF,
                         bitOffset: offset, bitSize: globals.reportSize,
-                        logicalMin: globals.logicalMin, logicalMax: lmax,
+                        logicalMin: globals.logicalMin, logicalMax: logicalMax,
                         isConstant: unsigned & 0x01 != 0,
-                        collection: cIndex, collectionUsage: cUsage
+                        collections: collections
                     ))
                     offset += globals.reportSize
                 }
                 bitsPerReport[kind, default: [:]][rid] = offset
-                usages = []; usageMin = nil; usageMax = nil
+                resetLocals()
             case (0, 0xA):
-                collections.append((nextCollection, usages.first ?? usageMin ?? 0))
+                let usage = usages.isEmpty ? (usageMin ?? 0) : Self.usage(usages, at: 0)
+                collections.append(HIDField.Collection(index: nextCollection, usage: usage))
                 nextCollection += 1
-                usages = []; usageMin = nil; usageMax = nil
+                resetLocals()
             case (0, 0xC):
                 _ = collections.popLast()
+                resetLocals()
             // Global items
             case (1, 0x0): globals.usagePage = unsigned
             case (1, 0x1): globals.logicalMin = signed
-            case (1, 0x2): globals.logicalMax = signed
+            case (1, 0x2):
+                globals.logicalMaxSigned = signed
+                globals.logicalMaxUnsigned = Int64(unsigned)
             case (1, 0x7): globals.reportSize = Int(unsigned)
             case (1, 0x8): globals.reportID = UInt8(truncatingIfNeeded: unsigned)
             case (1, 0x9): globals.reportCount = Int(unsigned)
             case (1, 0xA): globalStack.append(globals)
             case (1, 0xB): globals = globalStack.popLast() ?? globals
             // Local items
-            case (2, 0x0): usages.append(qualify(unsigned, size: size))
-            case (2, 0x1): usageMin = qualify(unsigned, size: size)
-            case (2, 0x2): usageMax = qualify(unsigned, size: size)
+            case (2, 0x0): usages.append(.single(qualify(unsigned, size: size)))
+            case (2, 0x1):
+                usageMin = qualify(unsigned, size: size)
+                closeRangeIfComplete()
+            case (2, 0x2):
+                usageMax = qualify(unsigned, size: size)
+                closeRangeIfComplete()
             default: break
             }
         }

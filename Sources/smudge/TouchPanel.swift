@@ -25,8 +25,37 @@ private enum Usage {
     static let certificationBlob: UInt32 = 0xC5
 }
 
+/// Collects contacts into frames. In hybrid mode a frame spans several reports: the first
+/// carries the total contact count, continuations carry zero.
+struct FrameAssembler {
+    private var pending: (expected: Int, received: Int, contacts: [Contact])?
+
+    /// Feeds one report's slots (nil = lifted) and its Contact Count, if the device has one.
+    /// Returns a frame once it is complete.
+    mutating func add(count: Int?, slots: [Contact?]) -> [Contact]? {
+        guard let count else { return slots.compactMap { $0 } }
+        // A new non-zero count starts a frame, dropping one left incomplete by a lost report.
+        if count > 0 || pending == nil {
+            pending = (count, 0, [])
+        }
+        guard var frame = pending else { return nil }
+        let take = min(frame.expected - frame.received, slots.count)
+        frame.contacts += slots.prefix(take).compactMap { $0 }
+        frame.received += take
+        if frame.received >= frame.expected {
+            pending = nil
+            return frame.contacts
+        }
+        pending = frame
+        return nil
+    }
+
+    /// Slot index of the next report's first slot, used as fallback contact ID.
+    var nextSlot: Int { pending?.received ?? 0 }
+}
+
 /// Report layout of one multi-touch digitizer.
-private struct Layout {
+struct Layout {
     struct Slot {
         let tip: HIDField
         let id: HIDField?
@@ -40,12 +69,18 @@ private struct Layout {
 
     init?(_ descriptor: HIDDescriptor) {
         let inputs = descriptor.fields.filter { $0.kind == .input && !$0.isConstant }
-        let fingerCollections = Dictionary(grouping: inputs.filter {
-            $0.collectionUsage == (digitizerPage << 16 | Usage.finger)
-        }, by: \.collection)
+
+        // Group by the nearest enclosing Finger collection, so fields nested in
+        // sub-collections (e.g. X/Y inside a Physical collection) still belong to it.
+        var fingers: [Int: [HIDField]] = [:]
+        for field in inputs {
+            if let finger = field.collection(digitizerPage, Usage.finger) {
+                fingers[finger.index, default: []].append(field)
+            }
+        }
 
         var slots: [(Int, Slot)] = []
-        for (collection, fields) in fingerCollections {
+        for (collection, fields) in fingers {
             guard let tip = fields.first(where: { $0.matches(digitizerPage, Usage.tipSwitch) }),
                   let x = fields.first(where: { $0.matches(genericDesktopPage, Usage.x) }),
                   let y = fields.first(where: { $0.matches(genericDesktopPage, Usage.y) })
@@ -53,24 +88,30 @@ private struct Layout {
             let id = fields.first { $0.matches(digitizerPage, Usage.contactID) }
             slots.append((collection, Slot(tip: tip, id: id, x: x, y: y)))
         }
+        slots.sort { $0.0 < $1.0 }
         guard let first = slots.first else { return nil }
 
         let rid = first.1.tip.reportID
         reportID = rid
-        self.slots = slots.sorted { $0.0 < $1.0 }.map(\.1).filter { $0.tip.reportID == rid }
-        contactCount = inputs.first { $0.reportID == rid && $0.matches(digitizerPage, Usage.contactCount) }
+        self.slots = slots.map(\.1).filter { $0.tip.reportID == rid }
+        contactCount = inputs.first {
+            $0.reportID == rid && $0.matches(digitizerPage, Usage.contactCount)
+                && $0.collection(digitizerPage, Usage.finger) == nil
+        }
     }
 
-    func contacts(_ payload: UnsafeBufferPointer<UInt8>) -> [Contact] {
-        // Hybrid-mode devices put the real count only in the first report of a frame;
-        // this panel reports all slots at once, so a missing count means "all slots".
-        let count = contactCount.flatMap { $0.read(payload) }.map(Int.init) ?? slots.count
-        return slots.prefix(max(0, min(count, slots.count))).enumerated().compactMap { index, slot in
+    func count(_ payload: UnsafeBufferPointer<UInt8>) -> Int? {
+        contactCount?.read(payload).map { max(0, Int($0)) }
+    }
+
+    /// Every slot of a report, nil for lifted contacts (hybrid frames still count them).
+    func slots(_ payload: UnsafeBufferPointer<UInt8>, firstIndex: Int) -> [Contact?] {
+        slots.enumerated().map { index, slot in
             guard slot.tip.read(payload) == 1,
                   let rx = slot.x.read(payload), let ry = slot.y.read(payload)
             else { return nil }
             return Contact(
-                id: slot.id?.read(payload) ?? Int64(index),
+                id: slot.id?.read(payload) ?? Int64(firstIndex + index),
                 x: normalize(rx, slot.x),
                 y: normalize(ry, slot.y)
             )
@@ -92,6 +133,7 @@ final class TouchPanel {
     private let layout: Layout
     private let buffer: UnsafeMutablePointer<UInt8>
     private let bufferSize: Int
+    private var frames = FrameAssembler()
     var onFrame: (([Contact]) -> Void)?
 
     init?(_ device: IOHIDDevice) {
@@ -107,7 +149,9 @@ final class TouchPanel {
     }
 
     deinit {
-        IOHIDDeviceRegisterInputReportCallback(device, buffer, bufferSize, nil, nil)
+        // Callbacks are removed by their registration context, not by passing nil.
+        // Delivery happens on the main run loop, as does this deinit, so none can follow.
+        IOHIDDeviceRegisterInputReportCallback(device, buffer, bufferSize, nil, Unmanaged.passUnretained(self).toOpaque())
         buffer.deallocate()
     }
 
@@ -154,7 +198,11 @@ final class TouchPanel {
         let skip = descriptor.usesReportIDs ? 1 : 0
         guard length > skip else { return }
         let payload = UnsafeBufferPointer(start: report + skip, count: length - skip)
-        onFrame?(layout.contacts(payload))
+
+        let slots = layout.slots(payload, firstIndex: frames.nextSlot)
+        if let frame = frames.add(count: layout.count(payload), slots: slots) {
+            onFrame?(frame)
+        }
     }
 }
 

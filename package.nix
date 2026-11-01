@@ -14,6 +14,7 @@ swiftPackages.stdenv.mkDerivation {
     fileset = lib.fileset.unions [
       ./Package.swift
       ./Sources
+      ./Tests
     ];
   };
 

@@ -1,6 +1,12 @@
 import CoreGraphics
 import Foundation
 
+/// A finger in screen coordinates; `id` stays the same while the finger is down.
+struct Touch {
+    let id: Int64
+    let point: CGPoint
+}
+
 /// Turns frames of screen-space contacts into mouse, scroll and magnify events,
 /// following the usual touchscreen pointer emulation (libinput, Windows):
 /// the pointer jumps to the finger and one finger is the left button.
@@ -22,17 +28,21 @@ final class GestureEngine {
         /// Pause after a gesture before the pointer goes back, so the app handles the click
         /// while the pointer is still under the finger.
         var returnDelay: TimeInterval = 0.15
+        /// Pointer movement (points) that means a mouse or trackpad took over.
+        var takeoverDistance: Double = 2
     }
 
     private enum TwoFingerMode { case undecided, scroll, pinch }
 
     private struct TwoFinger {
         var mode = TwoFingerMode.undecided
-        var count: Int
+        /// Contact IDs currently taking part, sorted.
+        var ids: [Int64]
         var center: CGPoint
         var spread: Double
+        /// Spread a pinch is measured against; rebased whenever the fingers change.
+        var baseSpread: Double
         let startCenter: CGPoint
-        let startSpread: Double
         let since: TimeInterval
         /// Centroid travel since touch-down, excluding jumps from fingers landing or lifting.
         var travel = CGPoint.zero
@@ -41,12 +51,15 @@ final class GestureEngine {
 
     private enum State {
         case idle
-        case pressing(start: CGPoint, since: TimeInterval)
-        case down(last: CGPoint, clicks: Int64)
+        case pressing(id: Int64, start: CGPoint, last: CGPoint, since: TimeInterval)
+        case down(id: Int64, last: CGPoint, clicks: Int64)
         case twoFinger(TwoFinger)
+        /// The gesture is over but fingers remain; wait until they all lift.
+        case ignoring
     }
 
     private var state = State.idle
+    private var pressTimer: DispatchWorkItem?
     private var lastPress: (point: CGPoint, time: TimeInterval, clicks: Int64)?
     private var momentum: (timer: Timer, velocity: CGPoint, point: CGPoint, last: TimeInterval)?
     /// Where the pointer was before touching, if it should go back there afterwards.
@@ -60,89 +73,118 @@ final class GestureEngine {
     /// Bounds of the touch display, used to tell whether the pointer was elsewhere.
     var touchBounds: CGRect?
 
-    func handle(_ points: [CGPoint], now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
-        switch (state, points.count) {
-        case (.idle, 0):
-            break
+    func handle(_ touches: [Touch], now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        // Controllers may report slots in any order; identities, not positions, define fingers.
+        let touches = touches.sorted { $0.id < $1.id }
 
-        case (.idle, 1):
+        switch state {
+        case .idle:
+            guard !touches.isEmpty else { return }
             touchBegan()
-            Injector.mouse(.mouseMoved, at: points[0])
-            state = .pressing(start: points[0], since: now)
-
-        case (.idle, _):
-            touchBegan()
-            beginTwoFinger(points, now: now)
-
-        case (.pressing, 2...):
-            beginTwoFinger(points, now: now)
-
-        case let (.pressing(start, since), 1):
-            if now - since > tuning.secondFingerGrace || distance(points[0], start) > tuning.slop * 3 {
-                let clicks = press(at: start, now: now)
-                if points[0] != start { Injector.mouse(.leftMouseDragged, at: points[0], clicks: clicks) }
-                state = .down(last: points[0], clicks: clicks)
+            if touches.count == 1 {
+                beginPress(touches[0], now: now)
+            } else {
+                beginTwoFinger(touches, now: now)
             }
 
-        case let (.pressing(start, _), 0):
-            let clicks = press(at: start, now: now)
-            Injector.mouse(.leftMouseUp, at: start, clicks: clicks)
-            gestureEnded()
+        case let .pressing(id, start, _, since):
+            if touches.count >= 2 {
+                cancelPressTimer()
+                beginTwoFinger(touches, now: now)
+            } else if let touch = touches.first(where: { $0.id == id }) {
+                if distance(touch.point, start) > tuning.slop * 3 {
+                    pressAndDrag(id: id, start: start, to: touch.point, now: now)
+                } else {
+                    state = .pressing(id: id, start: start, last: touch.point, since: since)
+                }
+            } else {
+                // Lifted before the button went down: a tap.
+                cancelPressTimer()
+                let clicks = press(at: start, now: now)
+                Injector.mouse(.leftMouseUp, at: start, clicks: clicks)
+                finish(remaining: touches)
+            }
 
-        case let (.down(last, clicks), 1...):
-            // Extra fingers during a drag are ignored; the first contact keeps driving the pointer.
-            if points[0] != last { Injector.mouse(.leftMouseDragged, at: points[0], clicks: clicks) }
-            state = .down(last: points[0], clicks: clicks)
+        case let .down(id, last, clicks):
+            // Extra fingers during a drag are ignored; the pressing finger keeps driving the pointer.
+            if let touch = touches.first(where: { $0.id == id }) {
+                if touch.point != last { Injector.mouse(.leftMouseDragged, at: touch.point, clicks: clicks) }
+                state = .down(id: id, last: touch.point, clicks: clicks)
+            } else {
+                Injector.mouse(.leftMouseUp, at: last, clicks: clicks)
+                finish(remaining: touches)
+            }
 
-        case let (.down(last, clicks), 0):
+        case var .twoFinger(gesture):
+            if touches.isEmpty {
+                endTwoFinger(gesture, now: now)
+                finish(remaining: touches)
+            } else {
+                moveTwoFinger(&gesture, touches, now: now)
+                state = .twoFinger(gesture)
+            }
+
+        case .ignoring:
+            if touches.isEmpty { finish(remaining: touches) }
+        }
+    }
+
+    /// Abandons the current gesture without producing a click, e.g. when the panel disconnects.
+    func cancel() {
+        cancelPressTimer()
+        switch state {
+        case let .down(_, last, clicks):
             Injector.mouse(.leftMouseUp, at: last, clicks: clicks)
-            gestureEnded()
-
-        case (.twoFinger(var gesture), 1...):
-            moveTwoFinger(&gesture, points, now: now)
-            state = .twoFinger(gesture)
-
-        case let (.twoFinger(gesture), 0):
-            endTwoFinger(gesture, now: now)
-            gestureEnded()
-
+        case let .twoFinger(gesture) where gesture.mode == .scroll:
+            Injector.scroll(dx: 0, dy: 0, phase: .ended)
+        case let .twoFinger(gesture) where gesture.mode == .pinch:
+            Injector.magnify(0, at: gesture.startCenter, phase: .ended)
         default:
             break
         }
-    }
-
-    // MARK: Pointer return
-
-    private func touchBegan() {
-        // A quick follow-up touch (double tap, another flick) keeps the original home.
-        let carried = pendingReturn != nil || momentum != nil ? home : nil
+        stopMomentum()
         pendingReturn?.cancel()
         pendingReturn = nil
-        stopMomentum()
-        if let carried {
-            home = carried
-            return
-        }
-        let cursor = Injector.cursor
-        home = returnCursor && touchBounds.map { !$0.contains(cursor) } == true ? cursor : nil
+        home = nil
+        state = .idle
     }
 
-    private func gestureEnded() {
+    private func finish(remaining touches: [Touch]) {
+        guard touches.isEmpty else {
+            state = .ignoring
+            return
+        }
         state = .idle
         // With momentum running, the pointer goes back once it has settled.
         if momentum == nil { scheduleReturn() }
     }
 
-    private func scheduleReturn() {
-        guard let home else { return }
-        let item = DispatchWorkItem { [weak self] in
-            self?.pendingReturn = nil
-            self?.home = nil
-            Injector.mouse(.mouseMoved, at: home)
-            self?.trace("pointer returned")
+    // MARK: One finger
+
+    private func beginPress(_ touch: Touch, now: TimeInterval) {
+        Injector.mouse(.mouseMoved, at: touch.point)
+        state = .pressing(id: touch.id, start: touch.point, last: touch.point, since: now)
+
+        // Press once the grace period runs out, even if the panel stays silent while the finger rests.
+        let id = touch.id
+        let timer = DispatchWorkItem { [weak self] in
+            guard let self, case let .pressing(pressing, start, last, _) = self.state, pressing == id else { return }
+            self.pressAndDrag(id: id, start: start, to: last, now: ProcessInfo.processInfo.systemUptime)
         }
-        pendingReturn = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + tuning.returnDelay, execute: item)
+        pressTimer = timer
+        DispatchQueue.main.asyncAfter(deadline: .now() + tuning.secondFingerGrace, execute: timer)
+    }
+
+    private func cancelPressTimer() {
+        pressTimer?.cancel()
+        pressTimer = nil
+    }
+
+    private func pressAndDrag(id: Int64, start: CGPoint, to point: CGPoint, now: TimeInterval) {
+        cancelPressTimer()
+        let clicks = press(at: start, now: now)
+        if point != start { Injector.mouse(.leftMouseDragged, at: point, clicks: clicks) }
+        state = .down(id: id, last: point, clicks: clicks)
     }
 
     /// Presses the left button, counting consecutive presses for double/triple clicks.
@@ -159,20 +201,23 @@ final class GestureEngine {
 
     // MARK: Two fingers
 
-    private func beginTwoFinger(_ points: [CGPoint], now: TimeInterval) {
-        let c = centroid(points), s = spread(points)
+    private func beginTwoFinger(_ touches: [Touch], now: TimeInterval) {
+        let c = centroid(touches), s = spread(touches)
         Injector.mouse(.mouseMoved, at: c)
-        state = .twoFinger(TwoFinger(count: points.count, center: c, spread: s, startCenter: c, startSpread: s, since: now))
+        state = .twoFinger(TwoFinger(ids: touches.map(\.id), center: c, spread: s, baseSpread: s, startCenter: c, since: now))
     }
 
-    private func moveTwoFinger(_ g: inout TwoFinger, _ points: [CGPoint], now: TimeInterval) {
-        let c = centroid(points), s = spread(points)
+    private func moveTwoFinger(_ g: inout TwoFinger, _ touches: [Touch], now: TimeInterval) {
+        let c = centroid(touches), s = spread(touches)
 
-        // A finger landed or lifted: the centroid jumps, so rebase instead of scrolling by the jump.
-        if points.count != g.count {
-            g.count = points.count
+        // A finger landed, lifted or was replaced: the centroid and spread jump,
+        // so rebase instead of scrolling or zooming by the jump.
+        let ids = touches.map(\.id)
+        if ids != g.ids {
+            g.ids = ids
             g.center = c
             g.spread = s
+            g.baseSpread = s
             return
         }
 
@@ -181,10 +226,10 @@ final class GestureEngine {
 
         if g.mode == .undecided {
             let travel = hypot(g.travel.x, g.travel.y)
-            let spreadChange = points.count >= 2 ? abs(s - g.startSpread) : 0
+            let spreadChange = touches.count >= 2 ? abs(s - g.baseSpread) : 0
             if spreadChange > tuning.pinchSlop, spreadChange > travel {
                 g.mode = .pinch
-                g.spread = g.startSpread
+                g.spread = g.baseSpread
                 Injector.magnify(0, at: g.startCenter, phase: .began)
                 trace("pinch")
             } else if travel > tuning.scrollSlop {
@@ -203,7 +248,7 @@ final class GestureEngine {
             Injector.scroll(dx: delta.x, dy: delta.y, phase: .changed)
             g.samples.append((now, delta))
             g.samples.removeAll { now - $0.time > tuning.velocityWindow }
-        case .pinch where points.count >= 2 && g.spread > 0:
+        case .pinch where touches.count >= 2 && g.spread > 0:
             Injector.magnify(s / g.spread - 1, at: g.startCenter, phase: .changed)
             g.spread = s
         default:
@@ -230,9 +275,11 @@ final class GestureEngine {
     // MARK: Momentum
 
     private func startMomentum(_ g: TwoFinger, now: TimeInterval) {
-        guard let first = g.samples.first else { return }
+        // Only movement just before the lift counts; a pause before lifting means no fling.
+        let recent = g.samples.filter { now - $0.time <= tuning.velocityWindow }
+        guard let first = recent.first else { return }
         let span = max(now - first.time, 1.0 / 120)
-        let total = g.samples.reduce(CGPoint.zero) { CGPoint(x: $0.x + $1.delta.x, y: $0.y + $1.delta.y) }
+        let total = recent.reduce(CGPoint.zero) { CGPoint(x: $0.x + $1.delta.x, y: $0.y + $1.delta.y) }
         let velocity = CGPoint(x: total.x / span, y: total.y / span)
         guard hypot(velocity.x, velocity.y) > tuning.momentumMinSpeed else { return }
 
@@ -251,7 +298,7 @@ final class GestureEngine {
         m.last = now
         momentum = m
         // The pointer moved (trackpad or mouse took over): stop, as a trackpad does on touch.
-        if distance(Injector.cursor, m.point) > 2 {
+        if distance(Injector.cursor, m.point) > tuning.takeoverDistance {
             stopMomentum()
             home = nil // the user is steering the pointer now
             return
@@ -271,6 +318,41 @@ final class GestureEngine {
         Injector.scroll(dx: 0, dy: 0, phase: .momentumEnded)
     }
 
+    // MARK: Pointer return
+
+    private func touchBegan() {
+        // A quick follow-up touch (double tap, another flick) keeps the original home.
+        let carried = pendingReturn != nil || momentum != nil ? home : nil
+        pendingReturn?.cancel()
+        pendingReturn = nil
+        stopMomentum()
+        if let carried {
+            home = carried
+            return
+        }
+        let cursor = Injector.cursor
+        home = returnCursor && touchBounds.map { !$0.contains(cursor) } == true ? cursor : nil
+    }
+
+    private func scheduleReturn() {
+        guard let home else { return }
+        let left = Injector.cursor
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingReturn = nil
+            self.home = nil
+            // Someone moved the mouse in the meantime: leave the pointer with them.
+            if distance(Injector.cursor, left) > self.tuning.takeoverDistance {
+                self.trace("pointer return skipped")
+                return
+            }
+            Injector.mouse(.mouseMoved, at: home)
+            self.trace("pointer returned")
+        }
+        pendingReturn = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + tuning.returnDelay, execute: item)
+    }
+
     private func trace(_ message: String) {
         if verbose { log(message) }
     }
@@ -280,11 +362,11 @@ private func distance(_ a: CGPoint, _ b: CGPoint) -> Double {
     hypot(a.x - b.x, a.y - b.y)
 }
 
-private func centroid(_ points: [CGPoint]) -> CGPoint {
-    let pair = points.prefix(2)
+private func centroid(_ touches: [Touch]) -> CGPoint {
+    let pair = touches.prefix(2).map(\.point)
     return CGPoint(x: pair.map(\.x).reduce(0, +) / Double(pair.count), y: pair.map(\.y).reduce(0, +) / Double(pair.count))
 }
 
-private func spread(_ points: [CGPoint]) -> Double {
-    points.count < 2 ? 0 : distance(points[0], points[1])
+private func spread(_ touches: [Touch]) -> Double {
+    touches.count < 2 ? 0 : distance(touches[0].point, touches[1].point)
 }

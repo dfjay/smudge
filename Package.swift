@@ -9,5 +9,10 @@ let package = Package(
             name: "smudge",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
+        .testTarget(
+            name: "smudgeTests",
+            dependencies: ["smudge"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
     ]
 )

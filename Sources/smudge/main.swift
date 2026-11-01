@@ -16,7 +16,12 @@ struct Options {
         var args = args
         while let arg = args.popFirst() {
             switch arg {
-            case "--display", "-d": display = args.popFirst()
+            case "--display", "-d":
+                guard let value = args.popFirst(), !value.hasPrefix("-") else {
+                    log("\(arg) needs a display name (see --list)")
+                    exit(64)
+                }
+                display = value
             case "--verbose", "-v": verbose = true
             case "--list", "-l": list = true
             case "--return-cursor", "-r": returnCursor = true
@@ -78,7 +83,8 @@ final class Bridge {
         gestures.returnCursor = options.returnCursor
     }
 
-    func start() {
+    /// Opens the HID manager; returns the IOKit result. Matching panels attach once the run loop runs.
+    func start() -> IOReturn {
         IOHIDManagerSetDeviceMatching(manager, [
             kIOHIDDeviceUsagePageKey: 0x0D,
             kIOHIDDeviceUsageKey: 0x04,
@@ -93,10 +99,7 @@ final class Bridge {
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
 
         let result = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
-        if result != kIOReturnSuccess {
-            log(String(format: "cannot open HID devices (0x%X); grant Input Monitoring to this binary or its terminal", result))
-            exit(1)
-        }
+        guard result == kIOReturnSuccess else { return result }
 
         // Panels fall back to mouse mode after sleep; switch them again on wake.
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
@@ -104,6 +107,7 @@ final class Bridge {
                 self?.panels.values.forEach { $0.activateMultiTouch() }
             }
         }
+        return result
     }
 
     private func attach(_ device: IOHIDDevice) {
@@ -119,9 +123,12 @@ final class Bridge {
     }
 
     private func detach(_ device: IOHIDDevice) {
-        if let panel = panels.removeValue(forKey: device) {
-            log("detached \(panel.name)")
-        }
+        guard let panel = panels.removeValue(forKey: device) else { return }
+        // Unplugged mid-gesture: release the button and end scrolling instead of leaving them stuck.
+        gestures.cancel()
+        touching = false
+        bounds = nil
+        log("detached \(panel.name)")
     }
 
     private func frame(_ contacts: [Contact]) {
@@ -133,7 +140,7 @@ final class Bridge {
         touching = !contacts.isEmpty
         guard let bounds else { return }
         gestures.handle(contacts.map {
-            CGPoint(x: bounds.minX + $0.x * bounds.width, y: bounds.minY + $0.y * bounds.height)
+            Touch(id: $0.id, point: CGPoint(x: bounds.minX + $0.x * bounds.width, y: bounds.minY + $0.y * bounds.height))
         })
     }
 }
@@ -158,20 +165,37 @@ if options.list {
     exit(0)
 }
 
-// Under launchd there is no terminal to inherit permissions from: ask for each one
-// (which adds this binary to the list in System Settings) and wait until granted.
-if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
-    _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
-    log("waiting for Input Monitoring permission (needed to read the touchscreen)")
-    while IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted { sleep(2) }
-}
-
-if !AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary) {
-    log("waiting for Accessibility permission (needed to post input events)")
-    while !AXIsProcessTrusted() { sleep(2) }
+/// Exits when a permission is missing. Asking adds smudge to the lists in System Settings.
+/// A grant made while the process runs is not picked up, so exit and let launchd
+/// (KeepAlive) start a fresh process that sees it.
+func requirePermissions(hidResult: IOReturn) {
+    var missing: [String] = []
+    // Checked by actually opening the devices: IOHIDCheckAccess ignores a grant
+    // inherited from the terminal smudge was started from.
+    if hidResult == kIOReturnNotPermitted {
+        _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+        missing.append("Input Monitoring (to read the touchscreen)")
+    } else if hidResult != kIOReturnSuccess {
+        log(String(format: "cannot open HID devices (0x%X)", hidResult))
+        exit(1)
+    }
+    // The Accessibility prompt is a dialog; show it once rather than on every restart.
+    let marker = URL.cachesDirectory.appending(path: "com.dfjay.smudge/accessibility-prompted")
+    let prompt = !FileManager.default.fileExists(atPath: marker.path)
+    if !AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): prompt] as CFDictionary) {
+        if prompt {
+            try? FileManager.default.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
+            FileManager.default.createFile(atPath: marker.path, contents: nil)
+        }
+        missing.append("Accessibility (to post input events)")
+    }
+    guard !missing.isEmpty else { return }
+    log("missing permissions: \(missing.joined(separator: ", ")); grant them in System Settings → Privacy & Security, then restart smudge (launchd does it automatically)")
+    sleep(10) // keep launchd from restarting in a tight loop
+    exit(75)
 }
 
 let bridge = Bridge(options)
-bridge.start()
+requirePermissions(hidResult: bridge.start())
 log("running; target display: \(DisplayTarget(query: options.display).screen()?.localizedName ?? "none")")
 RunLoop.main.run()
