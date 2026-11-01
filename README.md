@@ -36,20 +36,30 @@ other panels are welcome.
 
 ## Install
 
-### home-manager
+### Home Manager
+
+Add the flake input:
 
 ```nix
-{
-  inputs.smudge.url = "github:dfjay/smudge";
+# flake.nix
+inputs.smudge = {
+  url = "github:dfjay/smudge";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+```
 
-  # in a home-manager configuration
-  imports = [ inputs.smudge.homeModules.default ];
+Then import the module and enable the service in your Home Manager configuration:
+
+```nix
+{ inputs, ... }:
+{
+  imports = [ inputs.smudge.homeModules.default ]; # also exported as homeManagerModules
 
   services.smudge = {
     enable = true;
-    display = "SU13TO";         # optional: name of the touch display; first external one by default
-    returnCursor = true;        # optional
-    signingIdentity = "My Code Signing"; # optional, see below
+    display = "SU13TO";                  # optional; first external display by default
+    returnCursor = true;                 # optional
+    signingIdentity = "My Code Signing"; # optional, see Permissions
   };
 }
 ```
@@ -57,7 +67,7 @@ other panels are welcome.
 This runs smudge as a launchd agent at login. It idles until a touchscreen is
 connected.
 
-### nix
+### Nix
 
 ```sh
 nix run github:dfjay/smudge -- --help
@@ -86,8 +96,10 @@ smudge [--display NAME] [--return-cursor] [--verbose] [--list]
 ## Permissions
 
 smudge needs **Input Monitoring** (to read the panel) and **Accessibility**
-(to post events). It asks for both on first launch and waits until they are
-granted in System Settings → Privacy & Security.
+(to post events). On first launch it asks for both and exits; grant them in
+System Settings → Privacy & Security. macOS only applies a grant to a new
+process, so the launchd agent restarts smudge until both are in place; when
+running it by hand, start it again.
 
 macOS ties these grants to the binary's code signature. Nix builds are ad-hoc
 signed, so every rebuild would need them granted again. To avoid that, create

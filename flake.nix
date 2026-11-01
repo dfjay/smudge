@@ -18,6 +18,8 @@
       });
 
       homeModules.default = import ./home-module.nix self;
+      # There is no settled name for this output; offer the other common one too.
+      homeManagerModules = self.homeModules;
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell.override { stdenv = pkgs.swiftPackages.stdenv; } {

@@ -66,21 +66,20 @@ in
       }
     ];
 
-    # Sign before launchd agents are set up; the store path is recorded so unchanged
-    # builds are not re-signed (and the agent is not restarted) on every activation.
     home.activation.smudgeSign = lib.mkIf (cfg.signingIdentity != null) (
       lib.hm.dag.entryBetween [ "setupLaunchAgents" ] [ "writeBoundary" ] ''
         smudgeSrc=${lib.getExe cfg.package}
         smudgeDir=${lib.escapeShellArg signedDir}
+        smudgeStamp="$smudgeSrc"$'\n'${lib.escapeShellArg cfg.signingIdentity}
         smudgeResigned=
-        if [[ "$(cat "$smudgeDir/.source" 2>/dev/null)" != "$smudgeSrc" ]]; then
+        if [[ ! -x "$smudgeDir/smudge" || "$(cat "$smudgeDir/.source" 2>/dev/null)" != "$smudgeStamp" ]]; then
           run mkdir -p "$smudgeDir"
           run install -m 755 "$smudgeSrc" "$smudgeDir/smudge.new"
           run /usr/bin/codesign --force --sign ${lib.escapeShellArg cfg.signingIdentity} \
             --identifier com.dfjay.smudge "$smudgeDir/smudge.new"
           run mv -f "$smudgeDir/smudge.new" "$smudgeDir/smudge"
           if [[ ! -v DRY_RUN ]]; then
-            echo "$smudgeSrc" > "$smudgeDir/.source"
+            printf '%s' "$smudgeStamp" > "$smudgeDir/.source"
           fi
           smudgeResigned=1
         fi
