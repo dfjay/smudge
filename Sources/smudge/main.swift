@@ -107,6 +107,10 @@ final class Bridge {
                 self?.panels.values.forEach { $0.activateMultiTouch() }
             }
         }
+        // Log where touches will go after a display is plugged, unplugged or rearranged.
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+            log("displays changed; target display: \(self?.target.screen()?.localizedName ?? "none")")
+        }
         return result
     }
 
@@ -195,7 +199,12 @@ func requirePermissions(hidResult: IOReturn) {
     exit(75)
 }
 
+// AppKit refreshes NSScreen.screens only inside a running NSApplication; under a bare
+// RunLoop the list stays as it was at launch, so a display plugged in later is never found.
+let app = NSApplication.shared
+app.setActivationPolicy(.prohibited)
+
 let bridge = Bridge(options)
 requirePermissions(hidResult: bridge.start())
 log("running; target display: \(DisplayTarget(query: options.display).screen()?.localizedName ?? "none")")
-RunLoop.main.run()
+app.run()
