@@ -44,22 +44,28 @@ brew services start smudge
 ```
 
 This runs smudge as a launchd agent at login, mapped to the first external
-display. It idles until a touchscreen is connected.
+display. It idles until a touchscreen is connected. After `brew upgrade`, load
+the new version with `brew services restart smudge`.
 
 ### Release binary
 
 Each [release](https://github.com/dfjay/smudge/releases) has a universal
-(Apple silicon and Intel) binary for macOS 14 and later. It is not notarized,
-so a copy downloaded with a browser has to be cleared before it runs:
+(Apple silicon and Intel) binary for macOS 14 and later. To check that an
+archive was built from this repository by its publish workflow:
+
+```sh
+gh attestation verify smudge-*-macos-universal.tar.gz --repo dfjay/smudge \
+  --signer-workflow dfjay/smudge/.github/workflows/publish.yml
+```
+
+The binary is not notarized, so a copy downloaded with a browser has to be
+cleared before it runs:
 
 ```sh
 tar -xzf smudge-*-macos-universal.tar.gz
 xattr -d com.apple.quarantine smudge
 ./smudge --list
 ```
-
-`gh attestation verify smudge-*.tar.gz --repo dfjay/smudge` checks that the
-archive was built by this repository's release workflow.
 
 ### Home Manager
 
@@ -126,9 +132,11 @@ System Settings → Privacy & Security. macOS only applies a grant to a new
 process, so the launchd agent restarts smudge until both are in place; when
 running it by hand, start it again.
 
-macOS ties these grants to the binary's code signature. Release binaries, which
-is what Homebrew installs, are all signed with the same self-signed
-certificate, so that the grants carry over to the next version.
+macOS ties these grants to the binary's code signature and, for a bare binary
+like this one, to its path. Release binaries are all signed with the same
+self-signed certificate, and the Homebrew service runs a copy at a path that
+does not change (`$(brew --prefix)/var/smudge/smudge`), so that the grants
+carry over to the next version.
 
 Nix builds are ad-hoc signed, so every rebuild would need them granted again.
 To avoid that, create

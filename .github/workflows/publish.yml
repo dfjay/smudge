@@ -1,0 +1,159 @@
+name: publish
+# To redo a release: gh workflow run publish.yml --ref v1.2.3
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash # with -o pipefail
+
+jobs:
+  build:
+    if: github.ref_type == 'tag'
+    runs-on: macos-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      archive: ${{ steps.package.outputs.archive }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check the tag against VERSION
+        id: version
+        run: |
+          version="$(cat VERSION)"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match VERSION ($version)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Build a universal binary
+        run: |
+          swift build -c release --arch arm64 --arch x86_64
+          mkdir dist
+          cp "$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/smudge" dist/smudge
+          lipo -archs dist/smudge
+      # macOS ties Input Monitoring and Accessibility grants to the signing certificate,
+      # so every release must use the same one; CODESIGN_CERT_SHA1 pins it.
+      - name: Sign
+        env:
+          P12_BASE64: ${{ secrets.CODESIGN_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.CODESIGN_P12_PASSWORD }}
+          CERT_SHA1: ${{ vars.CODESIGN_CERT_SHA1 }}
+        run: |
+          if [ -z "$P12_BASE64" ]; then
+            echo "::error::CODESIGN_P12_BASE64 is not set; refusing to release an ad-hoc signed binary"
+            exit 1
+          fi
+          cert_sha1="$(printf '%s' "$CERT_SHA1" | tr -d ': ' | tr '[:lower:]' '[:upper:]')"
+          if ! [[ "$cert_sha1" =~ ^[0-9A-F]{40}$ ]]; then
+            echo "::error::CODESIGN_CERT_SHA1 must be the SHA-1 fingerprint of the signing certificate"
+            exit 1
+          fi
+
+          work="$(mktemp -d)"
+          keychain="$work/sign.keychain-db"
+          cleanup() {
+            security delete-keychain "$keychain" 2> /dev/null || true
+            rm -rf "$work"
+          }
+          trap cleanup EXIT
+
+          keychain_password="$(uuidgen)"
+          printf '%s' "$P12_BASE64" | base64 -D > "$work/cert.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$work/cert.p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" > /dev/null
+
+          if ! security find-identity -p codesigning "$keychain" | grep -q "$cert_sha1"; then
+            echo "::error::the certificate in CODESIGN_P12_BASE64 is not the one pinned by CODESIGN_CERT_SHA1"
+            exit 1
+          fi
+          codesign --force --keychain "$keychain" --sign "$cert_sha1" --identifier com.dfjay.smudge dist/smudge
+          codesign --verify --strict \
+            -R="identifier \"com.dfjay.smudge\" and certificate leaf = H\"$cert_sha1\"" dist/smudge
+          codesign -d -r- dist/smudge
+      - name: Package
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          archive="smudge-$VERSION-macos-universal.tar.gz"
+          cp LICENSE README.md dist/
+          tar -czf "$archive" -C dist smudge LICENSE README.md
+          shasum -a 256 "$archive" > checksums.txt
+          cat checksums.txt
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(cut -d ' ' -f 1 checksums.txt)" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: ./checksums.txt
+      # --clobber so that a rerun can replace the assets.
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" checksums.txt --clobber
+
+  tap:
+    needs: build
+    runs-on: ubuntu-latest
+    # One at a time, for the version check below.
+    concurrency:
+      group: homebrew-tap
+      cancel-in-progress: false
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: homebrew-tap
+          permission-contents: write
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/homebrew-tap
+          token: ${{ steps.app.outputs.token }}
+      - name: Update the formula
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          ARCHIVE: ${{ needs.build.outputs.archive }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+        run: |
+          formula=Formula/smudge.rb
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$ARCHIVE"
+
+          # Redoing an old release must not take the formula back to it.
+          current="$(sed -n 's|^  url ".*/smudge-\(.*\)-macos-universal\.tar\.gz"$|\1|p' "$formula")"
+          newest="$(printf '%s\n%s\n' "$current" "$VERSION" | sort -V | tail -n 1)"
+          if [ "$current" != "$VERSION" ] && [ "$newest" = "$current" ]; then
+            echo "::notice::the tap already has smudge $current; leaving it"
+            exit 0
+          fi
+
+          sed -i -e "s|^  url \".*\"$|  url \"$url\"|" \
+            -e "s|^  sha256 \".*\"$|  sha256 \"$SHA256\"|" "$formula"
+          if ! grep -qF "  url \"$url\"" "$formula" || ! grep -qF "  sha256 \"$SHA256\"" "$formula"; then
+            echo "::error::could not update url and sha256 in $formula"
+            exit 1
+          fi
+
+          if git diff --quiet; then
+            echo "::notice::the formula is already up to date"
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m "smudge $VERSION" "$formula"
+          git push
