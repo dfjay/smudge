@@ -7,7 +7,7 @@
 
 swiftPackages.stdenv.mkDerivation {
   pname = "smudge";
-  version = "0.1.0";
+  version = lib.fileContents ./VERSION;
 
   src = lib.fileset.toSource {
     root = ./.;

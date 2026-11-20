@@ -36,6 +36,31 @@ other panels are welcome.
 
 ## Install
 
+### Homebrew
+
+```sh
+brew install dfjay/tap/smudge
+brew services start smudge
+```
+
+This runs smudge as a launchd agent at login, mapped to the first external
+display. It idles until a touchscreen is connected.
+
+### Release binary
+
+Each [release](https://github.com/dfjay/smudge/releases) has a universal
+(Apple silicon and Intel) binary for macOS 14 and later. It is not notarized,
+so a copy downloaded with a browser has to be cleared before it runs:
+
+```sh
+tar -xzf smudge-*-macos-universal.tar.gz
+xattr -d com.apple.quarantine smudge
+./smudge --list
+```
+
+`gh attestation verify smudge-*.tar.gz --repo dfjay/smudge` checks that the
+archive was built by this repository's release workflow.
+
 ### Home Manager
 
 Add the flake input:
@@ -101,8 +126,12 @@ System Settings → Privacy & Security. macOS only applies a grant to a new
 process, so the launchd agent restarts smudge until both are in place; when
 running it by hand, start it again.
 
-macOS ties these grants to the binary's code signature. Nix builds are ad-hoc
-signed, so every rebuild would need them granted again. To avoid that, create
+macOS ties these grants to the binary's code signature. Release binaries, which
+is what Homebrew installs, are all signed with the same self-signed
+certificate, so that the grants carry over to the next version.
+
+Nix builds are ad-hoc signed, so every rebuild would need them granted again.
+To avoid that, create
 a self-signed certificate once (Keychain Access → Certificate Assistant →
 Create a Certificate…, Identity Type *Self-Signed Root*, Certificate Type
 *Code Signing*) and set `services.smudge.signingIdentity` to its name. The

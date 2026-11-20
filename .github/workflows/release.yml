@@ -1,0 +1,168 @@
+name: release
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      created: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+      - id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ steps.app.outputs.token }}
+
+  # Here rather than on the tag: a tag pushed with GITHUB_TOKEN starts no other workflow.
+  build:
+    needs: release-please
+    if: needs.release-please.outputs.created == 'true'
+    runs-on: macos-latest
+    permissions:
+      contents: write # upload the archive to the release
+      id-token: write # attest, keyless
+      attestations: write
+    outputs:
+      archive: ${{ steps.package.outputs.archive }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
+      - name: Build a universal binary
+        run: |
+          swift build -c release --arch arm64 --arch x86_64
+          mkdir dist
+          cp "$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/smudge" dist/smudge
+          lipo -archs dist/smudge
+      # macOS ties Input Monitoring and Accessibility grants to the code signature.
+      # An ad-hoc signature changes with every build; one made with the same
+      # certificate each time keeps the grants across upgrades. The certificate is
+      # self-signed: this is not notarization and does not satisfy Gatekeeper.
+      - name: Sign
+        env:
+          P12_BASE64: ${{ secrets.CODESIGN_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.CODESIGN_P12_PASSWORD }}
+        run: |
+          if [ -z "$P12_BASE64" ]; then
+            echo "::error::CODESIGN_P12_BASE64 is not set; refusing to release an ad-hoc signed binary"
+            exit 1
+          fi
+          keychain="$RUNNER_TEMP/sign.keychain-db"
+          keychain_password="$(uuidgen)"
+          printf '%s' "$P12_BASE64" | base64 -D > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" > /dev/null
+          rm "$RUNNER_TEMP/cert.p12"
+          # A self-signed certificate is listed as untrusted, which codesign does not mind.
+          identity="$(security find-identity -p codesigning "$keychain" | awk '/^ *1\)/ { print $2; exit }')"
+          codesign --force --keychain "$keychain" --sign "$identity" --identifier com.dfjay.smudge dist/smudge
+          security delete-keychain "$keychain"
+          codesign --verify --strict dist/smudge
+          codesign -d -r- dist/smudge 2>&1 | tee "$RUNNER_TEMP/requirement"
+          grep -q 'identifier "com.dfjay.smudge" and certificate leaf = H"' "$RUNNER_TEMP/requirement"
+      - name: Package
+        id: package
+        env:
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          archive="smudge-$VERSION-macos-universal.tar.gz"
+          cp LICENSE README.md dist/
+          tar -czf "$archive" -C dist smudge LICENSE README.md
+          shasum -a 256 "$archive" > checksums.txt
+          cat checksums.txt
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(cut -d ' ' -f 1 checksums.txt)" >> "$GITHUB_OUTPUT"
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release-please.outputs.tag }}
+        run: gh release upload "$TAG" "${{ steps.package.outputs.archive }}" checksums.txt
+      # Build provenance for the archive; check with `gh attestation verify <file> --repo dfjay/smudge`.
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: ./checksums.txt
+
+  # Points the Homebrew formula in dfjay/homebrew-tap at the new archive.
+  tap:
+    needs: [release-please, build]
+    runs-on: ubuntu-latest
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: homebrew-tap
+      - name: Update the formula
+        env:
+          TOKEN: ${{ steps.app.outputs.token }}
+          TAG: ${{ needs.release-please.outputs.tag }}
+          VERSION: ${{ needs.release-please.outputs.version }}
+          ARCHIVE: ${{ needs.build.outputs.archive }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+        run: |
+          # Plain git rather than actions/checkout, which cannot check out an empty repository.
+          git clone "https://x-access-token:$TOKEN@github.com/$GITHUB_REPOSITORY_OWNER/homebrew-tap.git" tap
+          cd tap
+          git checkout -B main
+          mkdir -p Formula
+          cat > Formula/smudge.rb <<EOF
+          # Written by the release workflow of $GITHUB_REPOSITORY; edit it there.
+          class Smudge < Formula
+            desc "Multi-touch support for external USB touchscreens on macOS"
+            homepage "https://github.com/$GITHUB_REPOSITORY"
+            url "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$ARCHIVE"
+            version "$VERSION"
+            sha256 "$SHA256"
+            license "MIT"
+
+            depends_on macos: :sonoma
+
+            def install
+              bin.install "smudge"
+            end
+
+            service do
+              run [opt_bin/"smudge"]
+              keep_alive true
+              process_type :interactive
+              error_log_path var/"log/smudge.log"
+            end
+
+            def caveats
+              <<~EOS
+                smudge needs Input Monitoring and Accessibility. Start it with
+                  brew services start smudge
+                and grant both in System Settings → Privacy & Security.
+              EOS
+            end
+
+            test do
+              assert_match "usage: smudge", shell_output("#{bin}/smudge --help")
+            end
+          end
+          EOF
+          git add Formula/smudge.rb
+          git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m "smudge $VERSION"
+          git push origin main
