@@ -1,12 +1,20 @@
 name: publish
-# To redo a release: gh workflow run publish.yml --ref v1.2.3
+# To redo a release with the workflow as it is on main:
+#   gh workflow run publish.yml -f tag=v1.2.3
 on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag of an existing release
+        required: true
 
 permissions:
   contents: read
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 defaults:
   run:
@@ -14,7 +22,6 @@ defaults:
 
 jobs:
   build:
-    if: github.ref_type == 'tag'
     runs-on: macos-latest
     permissions:
       contents: write
@@ -26,12 +33,14 @@ jobs:
       sha256: ${{ steps.package.outputs.sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
       - name: Check the tag against VERSION
         id: version
         run: |
           version="$(cat VERSION)"
-          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match VERSION ($version)"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match VERSION ($version)"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -74,12 +83,17 @@ jobs:
           security unlock-keychain -p "$keychain_password" "$keychain"
           security import "$work/cert.p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" > /dev/null
+          # codesign only finds identities in keychains on the search list.
+          keychains=()
+          while IFS= read -r line; do keychains+=("$line"); done \
+            < <(security list-keychains -d user | sed -e 's/^ *"//' -e 's/"$//')
+          security list-keychains -d user -s "$keychain" "${keychains[@]}"
 
           if ! security find-identity -p codesigning "$keychain" | grep -q "$cert_sha1"; then
             echo "::error::the certificate in CODESIGN_P12_BASE64 is not the one pinned by CODESIGN_CERT_SHA1"
             exit 1
           fi
-          codesign --force --keychain "$keychain" --sign "$cert_sha1" --identifier com.dfjay.smudge dist/smudge
+          codesign --force --sign "$cert_sha1" --identifier com.dfjay.smudge dist/smudge
           codesign --verify --strict \
             -R="identifier \"com.dfjay.smudge\" and certificate leaf = H\"$cert_sha1\"" dist/smudge
           codesign -d -r- dist/smudge
@@ -103,7 +117,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ARCHIVE: ${{ steps.package.outputs.archive }}
-        run: gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" checksums.txt --clobber
+        run: gh release upload "$TAG" "$ARCHIVE" checksums.txt --clobber
 
   tap:
     needs: build
@@ -132,7 +146,7 @@ jobs:
           SHA256: ${{ needs.build.outputs.sha256 }}
         run: |
           formula=Formula/smudge.rb
-          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$ARCHIVE"
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$ARCHIVE"
 
           # Redoing an old release must not take the formula back to it.
           current="$(sed -n 's|^  url ".*/smudge-\(.*\)-macos-universal\.tar\.gz"$|\1|p' "$formula")"
